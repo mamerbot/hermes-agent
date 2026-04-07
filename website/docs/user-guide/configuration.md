@@ -88,6 +88,8 @@ terminal:
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
 ```
 
+For cloud sandboxes such as Modal and Daytona, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
+
 ### Backend Overview
 
 | Backend | Where commands run | Isolation | Best for |
@@ -188,7 +190,7 @@ terminal:
 
 **Required:** Either `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` environment variables, or a `~/.modal.toml` config file.
 
-**Persistence:** When enabled, the sandbox filesystem is snapshotted on cleanup and restored on next session. Snapshots are tracked in `~/.hermes/modal_snapshots.json`.
+**Persistence:** When enabled, the sandbox filesystem is snapshotted on cleanup and restored on next session. Snapshots are tracked in `~/.hermes/modal_snapshots.json`. This preserves filesystem state, not live processes, PID space, or background jobs.
 
 **Credential files:** Automatically mounted from `~/.hermes/` (OAuth tokens, etc.) and synced before each command.
 
@@ -243,7 +245,7 @@ If terminal commands fail immediately or the terminal tool is reported as disabl
 - **Daytona** — Needs `DAYTONA_API_KEY`. The Daytona SDK handles server URL configuration.
 - **Singularity** — Needs `apptainer` or `singularity` in `$PATH`. Common on HPC clusters.
 
-When in doubt, set `terminal.backend` back to `local` and verify commands run there first.
+When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.
 
 ### Docker Volume Mounts
 
@@ -350,6 +352,31 @@ Commands that require `stdin_data` or sudo automatically fall back to one-shot m
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
 
+## Skill Settings
+
+Skills can declare their own configuration settings via their SKILL.md frontmatter. These are non-secret values (paths, preferences, domain settings) stored under the `skills.config` namespace in `config.yaml`.
+
+```yaml
+skills:
+  config:
+    wiki:
+      path: ~/wiki          # Used by the llm-wiki skill
+```
+
+**How skill settings work:**
+
+- `hermes config migrate` scans all enabled skills, finds unconfigured settings, and offers to prompt you
+- `hermes config show` displays all skill settings under "Skill Settings" with the skill they belong to
+- When a skill loads, its resolved config values are injected into the skill context automatically
+
+**Setting values manually:**
+
+```bash
+hermes config set skills.config.wiki.path ~/my-research-wiki
+```
+
+For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/docs/developer-guide/creating-skills#config-settings-configyaml).
+
 ## Memory Configuration
 
 ```yaml
@@ -359,6 +386,26 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
 ```
+
+## File Read Safety
+
+Controls how much content a single `read_file` call can return. Reads that exceed the limit are rejected with an error telling the agent to use `offset` and `limit` for a smaller range. This prevents a single read of a minified JS bundle or large data file from flooding the context window.
+
+```yaml
+file_read_max_chars: 100000  # default — ~25-35K tokens
+```
+
+Raise it if you're on a model with a large context window and frequently read big files. Lower it for small-context models to keep reads efficient:
+
+```yaml
+# Large context model (200K+)
+file_read_max_chars: 200000
+
+# Small local model (16K context)
+file_read_max_chars: 30000
+```
+
+The agent also deduplicates file reads automatically — if the same file region is read twice and the file hasn't changed, a lightweight stub is returned instead of re-sending the content. This resets on context compression so the agent can re-read files after their content is summarized away.
 
 ## Git Worktree Isolation
 
@@ -604,7 +651,7 @@ AUXILIARY_VISION_MODEL=openai/gpt-4o
 |----------|-------------|-------------|
 | `"auto"` | Best available (default). Vision tries OpenRouter → Nous → Codex. | — |
 | `"openrouter"` | Force OpenRouter — routes to any model (Gemini, GPT-4o, Claude, etc.) | `OPENROUTER_API_KEY` |
-| `"nous"` | Force Nous Portal | `hermes login` |
+| `"nous"` | Force Nous Portal | `hermes auth` |
 | `"codex"` | Force Codex OAuth (ChatGPT account). Supports vision (gpt-5.3-codex). | `hermes model` → Codex |
 | `"main"` | Use your active custom/main endpoint. This can come from `OPENAI_BASE_URL` + `OPENAI_API_KEY` or from a custom endpoint saved via `hermes model` / `config.yaml`. Works with OpenAI, local models, or any OpenAI-compatible API. | Custom endpoint credentials + base URL |
 
@@ -996,6 +1043,8 @@ browser:
   inactivity_timeout: 120        # Seconds before auto-closing idle sessions
   command_timeout: 30             # Timeout in seconds for browser commands (screenshot, navigate, etc.)
   record_sessions: false         # Auto-record browser sessions as WebM videos to ~/.hermes/browser_recordings/
+  camofox:
+    managed_persistence: false   # When true, Camofox sessions persist cookies/logins across restarts
 ```
 
 The browser toolset supports multiple providers. See the [Browser feature page](/docs/user-guide/features/browser) for details on Browserbase, Browser Use, and local Chrome CDP setup.

@@ -138,11 +138,11 @@ These providers have built-in support with dedicated provider IDs. Set the API k
 
 ```bash
 # z.ai / ZhipuAI GLM
-hermes chat --provider zai --model glm-4-plus
+hermes chat --provider zai --model glm-5
 # Requires: GLM_API_KEY in ~/.hermes/.env
 
 # Kimi / Moonshot AI
-hermes chat --provider kimi-coding --model moonshot-v1-auto
+hermes chat --provider kimi-coding --model kimi-for-coding
 # Requires: KIMI_API_KEY in ~/.hermes/.env
 
 # MiniMax (global endpoint)
@@ -162,7 +162,7 @@ Or set the provider permanently in `config.yaml`:
 ```yaml
 model:
   provider: "zai"       # or: kimi-coding, minimax, minimax-cn, alibaba
-  default: "glm-4-plus"
+  default: "glm-5"
 ```
 
 Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, or `DASHSCOPE_BASE_URL` environment variables.
@@ -218,15 +218,11 @@ model:
   api_key: your-key-or-leave-empty-for-local
 ```
 
-**Environment variables (`.env` file):**
-```bash
-# Add to ~/.hermes/.env
-OPENAI_BASE_URL=http://localhost:8000/v1
-OPENAI_API_KEY=your-key     # Any non-empty string for local servers
-LLM_MODEL=your-model-name
-```
+:::warning Legacy env vars
+`OPENAI_BASE_URL` and `LLM_MODEL` in `.env` are **deprecated**. The CLI ignores `LLM_MODEL` entirely (only the gateway reads it). Use `hermes model` or edit `config.yaml` directly — both persist correctly across restarts and Docker containers.
+:::
 
-All three approaches end up in the same runtime path. `hermes model` persists provider, model, and base URL to `config.yaml` so later sessions keep using that endpoint even if env vars are not set.
+Both approaches persist to `config.yaml`, which is the source of truth for model, provider, and base URL.
 
 ### Switching Models with `/model`
 
@@ -257,23 +253,73 @@ Everything below follows this same pattern — just change the URL, key, and mod
 
 ### Ollama — Local Models, Zero Config
 
-[Ollama](https://ollama.com/) runs open-weight models locally with one command. Best for: quick local experimentation, privacy-sensitive work, offline use.
+[Ollama](https://ollama.com/) runs open-weight models locally with one command. Best for: quick local experimentation, privacy-sensitive work, offline use. Supports tool calling via the OpenAI-compatible API.
 
 ```bash
 # Install and run a model
-ollama pull llama3.1:70b
+ollama pull qwen2.5-coder:32b
 ollama serve   # Starts on port 11434
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:11434/v1
-OPENAI_API_KEY=ollama           # Any non-empty string
-LLM_MODEL=llama3.1:70b
 ```
 
-Ollama's OpenAI-compatible endpoint supports chat completions, streaming, and tool calling (for supported models). No GPU required for smaller models — Ollama handles CPU inference automatically.
+Then configure Hermes:
+
+```bash
+hermes model
+# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+# Enter URL: http://localhost:11434/v1
+# Skip API key (Ollama doesn't need one)
+# Enter model name (e.g. qwen2.5-coder:32b)
+```
+
+Or configure `config.yaml` directly:
+
+```yaml
+model:
+  default: qwen2.5-coder:32b
+  provider: custom
+  base_url: http://localhost:11434/v1
+  context_length: 32768   # See warning below
+```
+
+:::caution Ollama defaults to very low context lengths
+Ollama does **not** use your model's full context window by default. Depending on your VRAM, the default is:
+
+| Available VRAM | Default context |
+|----------------|----------------|
+| Less than 24 GB | **4,096 tokens** |
+| 24–48 GB | 32,768 tokens |
+| 48+ GB | 256,000 tokens |
+
+For agent use with tools, **you need at least 16k–32k context**. At 4k, the system prompt + tool schemas alone can fill the window, leaving no room for conversation.
+
+**How to increase it** (pick one):
+
+```bash
+# Option 1: Set server-wide via environment variable (recommended)
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+
+# Option 2: For systemd-managed Ollama
+sudo systemctl edit ollama.service
+# Add: Environment="OLLAMA_CONTEXT_LENGTH=32768"
+# Then: sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+# Option 3: Bake it into a custom model (persistent per-model)
+echo -e "FROM qwen2.5-coder:32b\nPARAMETER num_ctx 32768" > Modelfile
+ollama create qwen2.5-coder-32k -f Modelfile
+```
+
+**You cannot set context length through the OpenAI-compatible API** (`/v1/chat/completions`). It must be configured server-side or via a Modelfile. This is the #1 source of confusion when integrating Ollama with tools like Hermes.
+:::
+
+**Verify your context is set correctly:**
+
+```bash
+ollama ps
+# Look at the CONTEXT column — it should show your configured value
+```
 
 :::tip
-List available models with `ollama list`. Pull any model from the [Ollama library](https://ollama.com/library) with `ollama pull <model>`.
+List available models with `ollama list`. Pull any model from the [Ollama library](https://ollama.com/library) with `ollama pull <model>`. Ollama handles GPU offloading automatically — no configuration needed for most setups.
 :::
 
 ---
@@ -283,19 +329,39 @@ List available models with `ollama list`. Pull any model from the [Ollama librar
 [vLLM](https://docs.vllm.ai/) is the standard for production LLM serving. Best for: maximum throughput on GPU hardware, serving large models, continuous batching.
 
 ```bash
-# Start vLLM server
 pip install vllm
 vllm serve meta-llama/Llama-3.1-70B-Instruct \
   --port 8000 \
-  --tensor-parallel-size 2    # Multi-GPU
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:8000/v1
-OPENAI_API_KEY=dummy
-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+  --max-model-len 65536 \
+  --tensor-parallel-size 2 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
 ```
 
-vLLM supports tool calling, structured output, and multi-modal models. Use `--enable-auto-tool-choice` and `--tool-call-parser hermes` for Hermes-format tool calling with NousResearch models.
+Then configure Hermes:
+
+```bash
+hermes model
+# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+# Enter URL: http://localhost:8000/v1
+# Skip API key (or enter one if you configured vLLM with --api-key)
+# Enter model name: meta-llama/Llama-3.1-70B-Instruct
+```
+
+**Context length:** vLLM reads the model's `max_position_embeddings` by default. If that exceeds your GPU memory, it errors and asks you to set `--max-model-len` lower. You can also use `--max-model-len auto` to automatically find the maximum that fits. Set `--gpu-memory-utilization 0.95` (default 0.9) to squeeze more context into VRAM.
+
+**Tool calling requires explicit flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `--enable-auto-tool-choice` | Required for `tool_choice: "auto"` (the default in Hermes) |
+| `--tool-call-parser <name>` | Parser for the model's tool call format |
+
+Supported parsers: `hermes` (Qwen 2.5, Hermes 2/3), `llama3_json` (Llama 3.x), `mistral`, `deepseek_v3`, `deepseek_v31`, `xlam`, `pythonic`. Without these flags, tool calls won't work — the model will output tool calls as text.
+
+:::tip
+vLLM supports human-readable sizes: `--max-model-len 64k` (lowercase k = 1000, uppercase K = 1024).
+:::
 
 ---
 
@@ -304,18 +370,31 @@ vLLM supports tool calling, structured output, and multi-modal models. Use `--en
 [SGLang](https://github.com/sgl-project/sglang) is an alternative to vLLM with RadixAttention for KV cache reuse. Best for: multi-turn conversations (prefix caching), constrained decoding, structured output.
 
 ```bash
-# Start SGLang server
 pip install "sglang[all]"
 python -m sglang.launch_server \
   --model meta-llama/Llama-3.1-70B-Instruct \
-  --port 8000 \
-  --tp 2
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:8000/v1
-OPENAI_API_KEY=dummy
-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+  --port 30000 \
+  --context-length 65536 \
+  --tp 2 \
+  --tool-call-parser qwen
 ```
+
+Then configure Hermes:
+
+```bash
+hermes model
+# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+# Enter URL: http://localhost:30000/v1
+# Enter model name: meta-llama/Llama-3.1-70B-Instruct
+```
+
+**Context length:** SGLang reads from the model's config by default. Use `--context-length` to override. If you need to exceed the model's declared maximum, set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`.
+
+**Tool calling:** Use `--tool-call-parser` with the appropriate parser for your model family: `qwen` (Qwen 2.5), `llama3`, `llama4`, `deepseekv3`, `mistral`, `glm`. Without this flag, tool calls come back as plain text.
+
+:::caution SGLang defaults to 128 max output tokens
+If responses seem truncated, add `max_tokens` to your requests or set `--default-max-tokens` on the server. SGLang's default is only 128 tokens per response if not specified in the request.
+:::
 
 ---
 
@@ -327,18 +406,248 @@ LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
 # Build and start llama-server
 cmake -B build && cmake --build build --config Release
 ./build/bin/llama-server \
-  -m models/llama-3.1-8b-instruct-Q4_K_M.gguf \
+  --jinja -fa \
+  -c 32768 \
+  -ngl 99 \
+  -m models/qwen2.5-coder-32b-instruct-Q4_K_M.gguf \
   --port 8080 --host 0.0.0.0
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:8080/v1
-OPENAI_API_KEY=dummy
-LLM_MODEL=llama-3.1-8b-instruct
 ```
+
+**Context length (`-c`):** Recent builds default to `0` which reads the model's training context from the GGUF metadata. For models with 128k+ training context, this can OOM trying to allocate the full KV cache. Set `-c` explicitly to what you need (32k–64k is a good range for agent use). If using parallel slots (`-np`), the total context is divided among slots — with `-c 32768 -np 4`, each slot only gets 8k.
+
+Then configure Hermes to point at it:
+
+```bash
+hermes model
+# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+# Enter URL: http://localhost:8080/v1
+# Skip API key (local servers don't need one)
+# Enter model name — or leave blank to auto-detect if only one model is loaded
+```
+
+This saves the endpoint to `config.yaml` so it persists across sessions.
+
+:::caution `--jinja` is required for tool calling
+Without `--jinja`, llama-server ignores the `tools` parameter entirely. The model will try to call tools by writing JSON in its response text, but Hermes won't recognize it as a tool call — you'll see raw JSON like `{"name": "web_search", ...}` printed as a message instead of an actual search.
+
+Native tool calling support (best performance): Llama 3.x, Qwen 2.5 (including Coder), Hermes 2/3, Mistral, DeepSeek, Functionary. All other models use a generic handler that works but may be less efficient. See the [llama.cpp function calling docs](https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md) for the full list.
+
+You can verify tool support is active by checking `http://localhost:8080/props` — the `chat_template` field should be present.
+:::
 
 :::tip
 Download GGUF models from [Hugging Face](https://huggingface.co/models?library=gguf). Q4_K_M quantization offers the best balance of quality vs. memory usage.
 :::
+
+---
+
+### LM Studio — Desktop App with Local Models
+
+[LM Studio](https://lmstudio.ai/) is a desktop app for running local models with a GUI. Best for: users who prefer a visual interface, quick model testing, developers on macOS/Windows/Linux.
+
+Start the server from the LM Studio app (Developer tab → Start Server), or use the CLI:
+
+```bash
+lms server start                        # Starts on port 1234
+lms load qwen2.5-coder --context-length 32768
+```
+
+Then configure Hermes:
+
+```bash
+hermes model
+# Select "Custom endpoint (self-hosted / VLLM / etc.)"
+# Enter URL: http://localhost:1234/v1
+# Skip API key (LM Studio doesn't require one)
+# Enter model name
+```
+
+:::caution Context length often defaults to 2048
+LM Studio reads context length from the model's metadata, but many GGUF models report low defaults (2048 or 4096). **Always set context length explicitly** in the LM Studio model settings:
+
+1. Click the gear icon next to the model picker
+2. Set "Context Length" to at least 16384 (preferably 32768)
+3. Reload the model for the change to take effect
+
+Alternatively, use the CLI: `lms load model-name --context-length 32768`
+
+To set persistent per-model defaults: My Models tab → gear icon on the model → set context size.
+:::
+
+**Tool calling:** Supported since LM Studio 0.3.6. Models with native tool-calling training (Qwen 2.5, Llama 3.x, Mistral, Hermes) are auto-detected and shown with a tool badge. Other models use a generic fallback that may be less reliable.
+
+---
+
+### WSL2 Networking (Windows Users)
+
+Since Hermes Agent requires a Unix environment, Windows users run it inside WSL2. If your model server (Ollama, LM Studio, etc.) runs on the **Windows host**, you need to bridge the network gap — WSL2 uses a virtual network adapter with its own subnet, so `localhost` inside WSL2 refers to the Linux VM, **not** the Windows host.
+
+:::tip Both in WSL2? No problem.
+If your model server also runs inside WSL2 (common for vLLM, SGLang, and llama-server), `localhost` works as expected — they share the same network namespace. Skip this section.
+:::
+
+#### Option 1: Mirrored Networking Mode (Recommended)
+
+Available on **Windows 11 22H2+**, mirrored mode makes `localhost` work bidirectionally between Windows and WSL2 — the simplest fix.
+
+1. Create or edit `%USERPROFILE%\.wslconfig` (e.g., `C:\Users\YourName\.wslconfig`):
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+
+2. Restart WSL from PowerShell:
+   ```powershell
+   wsl --shutdown
+   ```
+
+3. Reopen your WSL2 terminal. `localhost` now reaches Windows services:
+   ```bash
+   curl http://localhost:11434/v1/models   # Ollama on Windows — works
+   ```
+
+:::note Hyper-V Firewall
+On some Windows 11 builds, the Hyper-V firewall blocks mirrored connections by default. If `localhost` still doesn't work after enabling mirrored mode, run this in an **Admin PowerShell**:
+```powershell
+Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow
+```
+:::
+
+#### Option 2: Use the Windows Host IP (Windows 10 / older builds)
+
+If you can't use mirrored mode, find the Windows host IP from inside WSL2 and use that instead of `localhost`:
+
+```bash
+# Get the Windows host IP (the default gateway of WSL2's virtual network)
+ip route show | grep -i default | awk '{ print $3 }'
+# Example output: 172.29.192.1
+```
+
+Use that IP in your Hermes config:
+
+```yaml
+model:
+  default: qwen2.5-coder:32b
+  provider: custom
+  base_url: http://172.29.192.1:11434/v1   # Windows host IP, not localhost
+```
+
+:::tip Dynamic helper
+The host IP can change on WSL2 restart. You can grab it dynamically in your shell:
+```bash
+export WSL_HOST=$(ip route show | grep -i default | awk '{ print $3 }')
+echo "Windows host at: $WSL_HOST"
+curl http://$WSL_HOST:11434/v1/models   # Test Ollama
+```
+
+Or use your machine's mDNS name (requires `libnss-mdns` in WSL2):
+```bash
+sudo apt install libnss-mdns
+curl http://$(hostname).local:11434/v1/models
+```
+:::
+
+#### Server Bind Address (Required for NAT Mode)
+
+If you're using **Option 2** (NAT mode with the host IP), the model server on Windows must accept connections from outside `127.0.0.1`. By default, most servers only listen on localhost — WSL2 connections in NAT mode come from a different virtual subnet and will be refused. In mirrored mode, `localhost` maps directly so the default `127.0.0.1` binding works fine.
+
+| Server | Default bind | How to fix |
+|--------|-------------|------------|
+| **Ollama** | `127.0.0.1` | Set `OLLAMA_HOST=0.0.0.0` environment variable before starting Ollama (System Settings → Environment Variables on Windows, or edit the Ollama service) |
+| **LM Studio** | `127.0.0.1` | Enable **"Serve on Network"** in the Developer tab → Server settings |
+| **llama-server** | `127.0.0.1` | Add `--host 0.0.0.0` to the startup command |
+| **vLLM** | `0.0.0.0` | Already binds to all interfaces by default |
+| **SGLang** | `127.0.0.1` | Add `--host 0.0.0.0` to the startup command |
+
+**Ollama on Windows (detailed):** Ollama runs as a Windows service. To set `OLLAMA_HOST`:
+1. Open **System Properties** → **Environment Variables**
+2. Add a new **System variable**: `OLLAMA_HOST` = `0.0.0.0`
+3. Restart the Ollama service (or reboot)
+
+#### Windows Firewall
+
+Windows Firewall treats WSL2 as a separate network (in both NAT and mirrored mode). If connections still fail after the steps above, add a firewall rule for your model server's port:
+
+```powershell
+# Run in Admin PowerShell — replace PORT with your server's port
+New-NetFirewallRule -DisplayName "Allow WSL2 to Model Server" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 11434
+```
+
+Common ports: Ollama `11434`, vLLM `8000`, SGLang `30000`, llama-server `8080`, LM Studio `1234`.
+
+#### Quick Verification
+
+From inside WSL2, test that you can reach your model server:
+
+```bash
+# Replace URL with your server's address and port
+curl http://localhost:11434/v1/models          # Mirrored mode
+curl http://172.29.192.1:11434/v1/models       # NAT mode (use your actual host IP)
+```
+
+If you get a JSON response listing your models, you're good. Use that same URL as the `base_url` in your Hermes config.
+
+---
+
+### Troubleshooting Local Models
+
+These issues affect **all** local inference servers when used with Hermes.
+
+#### "Connection refused" from WSL2 to a Windows-hosted model server
+
+If you're running Hermes inside WSL2 and your model server on the Windows host, `http://localhost:<port>` won't work in WSL2's default NAT networking mode. See [WSL2 Networking](#wsl2-networking-windows-users) above for the fix.
+
+#### Tool calls appear as text instead of executing
+
+The model outputs something like `{"name": "web_search", "arguments": {...}}` as a message instead of actually calling the tool.
+
+**Cause:** Your server doesn't have tool calling enabled, or the model doesn't support it through the server's tool calling implementation.
+
+| Server | Fix |
+|--------|-----|
+| **llama.cpp** | Add `--jinja` to the startup command |
+| **vLLM** | Add `--enable-auto-tool-choice --tool-call-parser hermes` |
+| **SGLang** | Add `--tool-call-parser qwen` (or appropriate parser) |
+| **Ollama** | Tool calling is enabled by default — make sure your model supports it (check with `ollama show model-name`) |
+| **LM Studio** | Update to 0.3.6+ and use a model with native tool support |
+
+#### Model seems to forget context or give incoherent responses
+
+**Cause:** Context window is too small. When the conversation exceeds the context limit, most servers silently drop older messages. Hermes's system prompt + tool schemas alone can use 4k–8k tokens.
+
+**Diagnosis:**
+
+```bash
+# Check what Hermes thinks the context is
+# Look at startup line: "Context limit: X tokens"
+
+# Check your server's actual context
+# Ollama: ollama ps (CONTEXT column)
+# llama.cpp: curl http://localhost:8080/props | jq '.default_generation_settings.n_ctx'
+# vLLM: check --max-model-len in startup args
+```
+
+**Fix:** Set context to at least **32,768 tokens** for agent use. See each server's section above for the specific flag.
+
+#### "Context limit: 2048 tokens" at startup
+
+Hermes auto-detects context length from your server's `/v1/models` endpoint. If the server reports a low value (or doesn't report one at all), Hermes uses the model's declared limit which may be wrong.
+
+**Fix:** Set it explicitly in `config.yaml`:
+
+```yaml
+model:
+  default: your-model
+  provider: custom
+  base_url: http://localhost:11434/v1
+  context_length: 32768
+```
+
+#### Responses get cut off mid-sentence
+
+**Possible causes:**
+1. **Low `max_tokens` on the server** — SGLang defaults to 128 tokens per response. Set `--default-max-tokens` on the server or configure Hermes with `model.max_tokens` in config.yaml.
+2. **Context exhaustion** — The model filled its context window. Increase context length or enable [context compression](/docs/user-guide/configuration#context-compression) in Hermes.
 
 ---
 
@@ -353,12 +662,9 @@ litellm --model anthropic/claude-sonnet-4 --port 4000
 
 # Or with a config file for multiple models:
 litellm --config litellm_config.yaml --port 4000
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:4000/v1
-OPENAI_API_KEY=sk-your-litellm-key
-LLM_MODEL=anthropic/claude-sonnet-4
 ```
+
+Then configure Hermes with `hermes model` → Custom endpoint → `http://localhost:4000/v1`.
 
 Example `litellm_config.yaml` with fallback:
 ```yaml
@@ -384,12 +690,9 @@ router_settings:
 ```bash
 # Install and start
 npx @blockrun/clawrouter    # Starts on port 8402
-
-# Configure Hermes
-OPENAI_BASE_URL=http://localhost:8402/v1
-OPENAI_API_KEY=dummy
-LLM_MODEL=blockrun/auto     # or: blockrun/eco, blockrun/premium, blockrun/agentic
 ```
+
+Then configure Hermes with `hermes model` → Custom endpoint → `http://localhost:8402/v1` → model name `blockrun/auto`.
 
 Routing profiles:
 | Profile | Strategy | Savings |
@@ -423,11 +726,14 @@ Any service with an OpenAI-compatible API works. Some popular options:
 | [LocalAI](https://localai.io) | `http://localhost:8080/v1` | Self-hosted, multi-model |
 | [Jan](https://jan.ai) | `http://localhost:1337/v1` | Desktop app with local models |
 
-```bash
-# Example: Together AI
-OPENAI_BASE_URL=https://api.together.xyz/v1
-OPENAI_API_KEY=your-together-key
-LLM_MODEL=meta-llama/Llama-3.1-70B-Instruct-Turbo
+Configure any of these with `hermes model` → Custom endpoint, or in `config.yaml`:
+
+```yaml
+model:
+  default: meta-llama/Llama-3.1-70B-Instruct-Turbo
+  provider: custom
+  base_url: https://api.together.xyz/v1
+  api_key: your-together-key
 ```
 
 ---
@@ -596,7 +902,7 @@ fallback_model:
 
 When activated, the fallback swaps the model and provider mid-session without losing your conversation. It fires **at most once** per session.
 
-Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `custom`.
+Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `deepseek`, `ai-gateway`, `opencode-zen`, `opencode-go`, `kilocode`, `alibaba`, `custom`.
 
 :::tip
 Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).

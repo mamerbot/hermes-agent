@@ -69,6 +69,7 @@ DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -124,6 +125,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "gemini": ProviderConfig(
+        id="gemini",
+        name="Google AI Studio",
+        auth_type="api_key",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        base_url_env_var="GEMINI_BASE_URL",
     ),
     "zai": ProviderConfig(
         id="zai",
@@ -200,6 +209,10 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="opencode-go",
         name="OpenCode Go",
         auth_type="api_key",
+        # OpenCode Go mixes API surfaces by model:
+        # - GLM / Kimi use OpenAI-compatible chat completions under /v1
+        # - MiniMax models use Anthropic Messages under /v1/messages
+        # Keep the provider base at /v1 and select api_mode per-model.
         inference_base_url="https://opencode.ai/zen/go/v1",
         api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
@@ -707,6 +720,32 @@ def deactivate_provider() -> None:
 # Provider Resolution — picks which provider to use
 # =============================================================================
 
+
+def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
+    """Return a helpful hint string when provider resolution fails.
+
+    Checks for common config.yaml mistakes (malformed custom_providers, etc.)
+    and returns a human-readable diagnostic, or empty string if nothing found.
+    """
+    try:
+        from hermes_cli.config import validate_config_structure
+        issues = validate_config_structure()
+        if not issues:
+            return ""
+
+        lines = ["Config issue detected — run 'hermes doctor' for full diagnostics:"]
+        for ci in issues:
+            prefix = "ERROR" if ci.severity == "error" else "WARNING"
+            lines.append(f"  [{prefix}] {ci.message}")
+            # Show first line of hint
+            first_hint = ci.hint.splitlines()[0] if ci.hint else ""
+            if first_hint:
+                lines.append(f"    → {first_hint}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def resolve_provider(
     requested: Optional[str] = None,
     *,
@@ -728,6 +767,7 @@ def resolve_provider(
     # Normalize provider aliases
     _PROVIDER_ALIASES = {
         "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
+        "google": "gemini", "google-gemini": "gemini", "google-ai-studio": "gemini",
         "kimi": "kimi-coding", "moonshot": "kimi-coding",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "claude": "anthropic", "claude-code": "anthropic",
@@ -753,10 +793,14 @@ def resolve_provider(
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
-        raise AuthError(
-            f"Unknown provider '{normalized}'.",
-            code="invalid_provider",
-        )
+        # Check for common config.yaml issues that cause this error
+        _config_hint = _get_config_hint_for_unknown_provider(normalized)
+        msg = f"Unknown provider '{normalized}'."
+        if _config_hint:
+            msg += f"\n\n{_config_hint}"
+        else:
+            msg += " Check 'hermes model' for available providers, or run 'hermes doctor' to diagnose config issues."
+        raise AuthError(msg, code="invalid_provider")
 
     # Explicit one-off CLI creds always mean openrouter/custom
     if explicit_api_key or explicit_base_url:
@@ -892,7 +936,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
-            "No Codex credentials stored. Run `hermes login` to authenticate.",
+            "No Codex credentials stored. Run `hermes auth` to authenticate.",
             provider="openai-codex",
             code="codex_auth_missing",
             relogin_required=True,
@@ -900,7 +944,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     tokens = state.get("tokens")
     if not isinstance(tokens, dict):
         raise AuthError(
-            "Codex auth state is missing tokens. Run `hermes login` to re-authenticate.",
+            "Codex auth state is missing tokens. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_invalid_shape",
             relogin_required=True,
@@ -909,14 +953,14 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
         raise AuthError(
-            "Codex auth is missing access_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing access_token. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_access_token",
             relogin_required=True,
         )
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
-            "Codex auth is missing refresh_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_refresh_token",
             relogin_required=True,
@@ -951,7 +995,7 @@ def refresh_codex_oauth_pure(
     del access_token  # Access token is only used by callers to decide whether to refresh.
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
-            "Codex auth is missing refresh_token. Run `hermes login` to re-authenticate.",
+            "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_refresh_token",
             relogin_required=True,
@@ -985,6 +1029,14 @@ def refresh_codex_oauth_pure(
         except Exception:
             pass
         if code in {"invalid_grant", "invalid_token", "invalid_request"}:
+            relogin_required = True
+        if code == "refresh_token_reused":
+            message = (
+                "Codex refresh token was already consumed by another client "
+                "(e.g. Codex CLI or VS Code extension). "
+                "Run `codex` in your terminal to generate fresh tokens, "
+                "then run `hermes auth` to re-authenticate."
+            )
             relogin_required = True
         raise AuthError(
             message,
@@ -1047,7 +1099,8 @@ def _refresh_codex_auth_tokens(
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
-    Returns tokens dict if valid, None otherwise. Does NOT write to the shared file.
+    Returns tokens dict if valid and not expired, None otherwise.
+    Does NOT write to the shared file.
     """
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
@@ -1060,7 +1113,17 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
-        if not tokens.get("access_token") or not tokens.get("refresh_token"):
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        if not access_token or not refresh_token:
+            return None
+        # Reject expired tokens — importing stale tokens from ~/.codex/
+        # that can't be refreshed leaves the user stuck with "Login successful!"
+        # but no working credentials.
+        if _codex_access_token_is_expiring(access_token, 0):
+            logger.debug(
+                "Codex CLI tokens at %s are expired — skipping import.", auth_path,
+            )
             return None
         return dict(tokens)
     except Exception:
@@ -1088,7 +1151,7 @@ def resolve_codex_runtime_credentials(
             logger.info("Migrating Codex credentials from ~/.codex/ to Hermes auth store")
             print("⚠️  Migrating Codex credentials to Hermes's own auth store.")
             print("   This avoids conflicts with Codex CLI and VS Code.")
-            print("   Run `hermes login` to create a fully independent session.\n")
+            print("   Run `hermes auth` to create a fully independent session.\n")
             _save_codex_tokens(cli_tokens)
             data = _read_codex_tokens()
         else:
@@ -1375,6 +1438,89 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
     if not isinstance(key, str) or not key.strip():
         return False
     return not _is_expiring(state.get("agent_key_expires_at"), min_ttl_seconds)
+
+
+def resolve_nous_access_token(
+    *,
+    timeout_seconds: float = 15.0,
+    insecure: Optional[bool] = None,
+    ca_bundle: Optional[str] = None,
+    refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> str:
+    """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "nous")
+
+        if not state:
+            raise AuthError(
+                "Hermes is not logged into Nous Portal.",
+                provider="nous",
+                relogin_required=True,
+            )
+
+        portal_base_url = (
+            _optional_base_url(state.get("portal_base_url"))
+            or os.getenv("HERMES_PORTAL_BASE_URL")
+            or os.getenv("NOUS_PORTAL_BASE_URL")
+            or DEFAULT_NOUS_PORTAL_URL
+        ).rstrip("/")
+        client_id = str(state.get("client_id") or DEFAULT_NOUS_CLIENT_ID)
+        verify = _resolve_verify(insecure=insecure, ca_bundle=ca_bundle, auth_state=state)
+
+        access_token = state.get("access_token")
+        refresh_token = state.get("refresh_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise AuthError(
+                "No access token found for Nous Portal login.",
+                provider="nous",
+                relogin_required=True,
+            )
+
+        if not _is_expiring(state.get("expires_at"), refresh_skew_seconds):
+            return access_token
+
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise AuthError(
+                "Session expired and no refresh token is available.",
+                provider="nous",
+                relogin_required=True,
+            )
+
+        timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
+        with httpx.Client(
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+            verify=verify,
+        ) as client:
+            refreshed = _refresh_access_token(
+                client=client,
+                portal_base_url=portal_base_url,
+                client_id=client_id,
+                refresh_token=refresh_token,
+            )
+
+        now = datetime.now(timezone.utc)
+        access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
+        state["access_token"] = refreshed["access_token"]
+        state["refresh_token"] = refreshed.get("refresh_token") or refresh_token
+        state["token_type"] = refreshed.get("token_type") or state.get("token_type") or "Bearer"
+        state["scope"] = refreshed.get("scope") or state.get("scope")
+        state["obtained_at"] = now.isoformat()
+        state["expires_in"] = access_ttl
+        state["expires_at"] = datetime.fromtimestamp(
+            now.timestamp() + access_ttl,
+            tz=timezone.utc,
+        ).isoformat()
+        state["portal_base_url"] = portal_base_url
+        state["client_id"] = client_id
+        state["tls"] = {
+            "insecure": verify is False,
+            "ca_bundle": verify if isinstance(verify, str) else None,
+        }
+        _save_provider_state(auth_store, "nous", state)
+        _save_auth_store(auth_store)
+        return state["access_token"]
 
 
 def refresh_nous_oauth_pure(
@@ -1769,7 +1915,36 @@ def get_nous_auth_status() -> Dict[str, Any]:
 
 
 def get_codex_auth_status() -> Dict[str, Any]:
-    """Status snapshot for Codex auth."""
+    """Status snapshot for Codex auth.
+    
+    Checks the credential pool first (where `hermes auth` stores credentials),
+    then falls back to the legacy provider state.
+    """
+    # Check credential pool first — this is where `hermes auth` and
+    # `hermes model` store device_code tokens.
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool("openai-codex")
+        if pool and pool.has_credentials():
+            entry = pool.select()
+            if entry is not None:
+                api_key = (
+                    getattr(entry, "runtime_api_key", None)
+                    or getattr(entry, "access_token", "")
+                )
+                if api_key and not _codex_access_token_is_expiring(api_key, 0):
+                    return {
+                        "logged_in": True,
+                        "auth_store": str(_auth_file_path()),
+                        "last_refresh": getattr(entry, "last_refresh", None),
+                        "auth_mode": "chatgpt",
+                        "source": f"pool:{getattr(entry, 'label', 'unknown')}",
+                        "api_key": api_key,
+                    }
+    except Exception:
+        pass
+
+    # Fall back to legacy provider state
     try:
         creds = resolve_codex_runtime_credentials()
         return {
@@ -1778,6 +1953,7 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "last_refresh": creds.get("last_refresh"),
             "auth_mode": creds.get("auth_mode"),
             "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
         }
     except AuthError as exc:
         return {
@@ -1961,7 +2137,7 @@ def detect_external_credentials() -> List[Dict[str, Any]]:
         found.append({
             "provider": "openai-codex",
             "path": str(codex_path),
-            "label": f"Codex CLI credentials found ({codex_path}) — run `hermes login` to create a separate session",
+            "label": f"Codex CLI credentials found ({codex_path}) — run `hermes auth` to create a separate session",
         })
 
     return found
@@ -2056,8 +2232,18 @@ def _reset_config_provider() -> Path:
     return config_path
 
 
-def _prompt_model_selection(model_ids: List[str], current_model: str = "") -> Optional[str]:
-    """Interactive model selection. Puts current_model first with a marker. Returns chosen model ID or None."""
+def _prompt_model_selection(
+    model_ids: List[str],
+    current_model: str = "",
+    pricing: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Optional[str]:
+    """Interactive model selection. Puts current_model first with a marker. Returns chosen model ID or None.
+
+    If *pricing* is provided (``{model_id: {prompt, completion}}``), a compact
+    price indicator is shown next to each model in aligned columns.
+    """
+    from hermes_cli.models import _format_price_per_mtok
+
     # Reorder: current model first, then the rest (deduplicated)
     ordered = []
     if current_model and current_model in model_ids:
@@ -2066,14 +2252,60 @@ def _prompt_model_selection(model_ids: List[str], current_model: str = "") -> Op
         if mid not in ordered:
             ordered.append(mid)
 
-    # Build display labels with marker on current
+    # Column-aligned labels when pricing is available
+    has_pricing = bool(pricing and any(pricing.get(m) for m in ordered))
+    name_col = max((len(m) for m in ordered), default=0) + 2 if has_pricing else 0
+
+    # Pre-compute formatted prices and dynamic column widths
+    _price_cache: dict[str, tuple[str, str, str]] = {}
+    price_col = 3  # minimum width
+    cache_col = 0  # only set if any model has cache pricing
+    has_cache = False
+    if has_pricing:
+        for mid in ordered:
+            p = pricing.get(mid)  # type: ignore[union-attr]
+            if p:
+                inp = _format_price_per_mtok(p.get("prompt", ""))
+                out = _format_price_per_mtok(p.get("completion", ""))
+                cache_read = p.get("input_cache_read", "")
+                cache = _format_price_per_mtok(cache_read) if cache_read else ""
+                if cache:
+                    has_cache = True
+            else:
+                inp, out, cache = "", "", ""
+            _price_cache[mid] = (inp, out, cache)
+            price_col = max(price_col, len(inp), len(out))
+            cache_col = max(cache_col, len(cache))
+        if has_cache:
+            cache_col = max(cache_col, 5)  # minimum: "Cache" header
+
     def _label(mid):
+        if has_pricing:
+            inp, out, cache = _price_cache.get(mid, ("", "", ""))
+            price_part = f" {inp:>{price_col}}  {out:>{price_col}}"
+            if has_cache:
+                price_part += f"  {cache:>{cache_col}}"
+            base = f"{mid:<{name_col}}{price_part}"
+        else:
+            base = mid
         if mid == current_model:
-            return f"{mid}  ← currently in use"
-        return mid
+            base += "  ← currently in use"
+        return base
 
     # Default cursor on the current model (index 0 if it was reordered to top)
     default_idx = 0
+
+    # Build a pricing header hint for the menu title
+    menu_title = "Select default model:"
+    if has_pricing:
+        # Align the header with the model column.
+        # Each choice is "  {label}" (2 spaces) and simple_term_menu prepends
+        # a 3-char cursor region ("-> " or "   "), so content starts at col 5.
+        pad = " " * 5
+        header = f"\n{pad}{'':>{name_col}} {'In':>{price_col}}  {'Out':>{price_col}}"
+        if has_cache:
+            header += f"  {'Cache':>{cache_col}}"
+        menu_title += header + "  /Mtok"
 
     # Try arrow-key menu first, fall back to number input
     try:
@@ -2089,7 +2321,7 @@ def _prompt_model_selection(model_ids: List[str], current_model: str = "") -> Op
             menu_highlight_style=("fg_green",),
             cycle_cursor=True,
             clear_screen=False,
-            title="Select default model:",
+            title=menu_title,
         )
         idx = menu.show()
         if idx is None:
@@ -2105,12 +2337,13 @@ def _prompt_model_selection(model_ids: List[str], current_model: str = "") -> Op
         pass
 
     # Fallback: numbered list
-    print("Select default model:")
+    print(menu_title)
+    num_width = len(str(len(ordered) + 2))
     for i, mid in enumerate(ordered, 1):
-        print(f"  {i}. {_label(mid)}")
+        print(f"  {i:>{num_width}}. {_label(mid)}")
     n = len(ordered)
-    print(f"  {n + 1}. Enter custom model name")
-    print(f"  {n + 2}. Skip (keep current)")
+    print(f"  {n + 1:>{num_width}}. Enter custom model name")
+    print(f"  {n + 2:>{num_width}}. Skip (keep current)")
     print()
 
     while True:
@@ -2153,8 +2386,8 @@ def _save_model_choice(model_id: str) -> None:
 def login_command(args) -> None:
     """Deprecated: use 'hermes model' or 'hermes setup' instead."""
     print("The 'hermes login' command has been removed.")
-    print("Use 'hermes model' to select a provider and model,")
-    print("or 'hermes setup' for full interactive setup.")
+    print("Use 'hermes auth' to manage credentials,")
+    print("'hermes model' to select a provider, or 'hermes setup' for full setup.")
     raise SystemExit(0)
 
 
@@ -2164,17 +2397,25 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     # Check for existing Hermes-owned credentials
     try:
         existing = resolve_codex_runtime_credentials()
-        print("Existing Codex credentials found in Hermes auth store.")
-        try:
-            reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            reuse = "y"
-        if reuse in ("", "y", "yes"):
-            config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
-            print()
-            print("Login successful!")
-            print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-            return
+        # Verify the resolved token is actually usable (not expired).
+        # resolve_codex_runtime_credentials attempts refresh, so if we get
+        # here the token should be valid — but double-check before telling
+        # the user "Login successful!".
+        _resolved_key = existing.get("api_key", "")
+        if isinstance(_resolved_key, str) and _resolved_key and not _codex_access_token_is_expiring(_resolved_key, 60):
+            print("Existing Codex credentials found in Hermes auth store.")
+            try:
+                reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reuse = "y"
+            if reuse in ("", "y", "yes"):
+                config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
+                print()
+                print("Login successful!")
+                print(f"  Config updated: {config_path} (model.provider=openai-codex)")
+                return
+        else:
+            print("Existing Codex credentials are expired. Starting fresh login...")
     except AuthError:
         pass
 
@@ -2469,13 +2710,26 @@ def _nous_device_code_login(
         "agent_key_reused": None,
         "agent_key_obtained_at": None,
     }
-    return refresh_nous_oauth_from_state(
-        auth_state,
-        min_key_ttl_seconds=min_key_ttl_seconds,
-        timeout_seconds=timeout_seconds,
-        force_refresh=False,
-        force_mint=True,
-    )
+    try:
+        return refresh_nous_oauth_from_state(
+            auth_state,
+            min_key_ttl_seconds=min_key_ttl_seconds,
+            timeout_seconds=timeout_seconds,
+            force_refresh=False,
+            force_mint=True,
+        )
+    except AuthError as exc:
+        if exc.code == "subscription_required":
+            portal_url = auth_state.get(
+                "portal_base_url", DEFAULT_NOUS_PORTAL_URL
+            ).rstrip("/")
+            print()
+            print("Your Nous Portal account does not have an active subscription.")
+            print(f"  Subscribe here: {portal_url}/billing")
+            print()
+            print("After subscribing, run `hermes model` again to finish setup.")
+            raise SystemExit(1)
+        raise
 
 
 def _login_nous(args, pconfig: ProviderConfig) -> None:
@@ -2490,8 +2744,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
 
     try:
         auth_state = _nous_device_code_login(
-            portal_base_url=getattr(args, "portal_url", None) or pconfig.portal_base_url,
-            inference_base_url=getattr(args, "inference_url", None) or pconfig.inference_base_url,
+            portal_base_url=getattr(args, "portal_url", None),
+            inference_base_url=getattr(args, "inference_url", None),
             client_id=getattr(args, "client_id", None) or pconfig.client_id,
             scope=getattr(args, "scope", None) or pconfig.scope,
             open_browser=not getattr(args, "no_browser", False),
@@ -2500,6 +2754,7 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
             ca_bundle=ca_bundle,
             min_key_ttl_seconds=5 * 60,
         )
+
         inference_base_url = auth_state["inference_base_url"]
         verify: bool | str = False if insecure else (ca_bundle if ca_bundle else True)
 
@@ -2523,8 +2778,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                     code="invalid_token",
                 )
 
-            # Use curated model list (same as OpenRouter defaults) instead
-            # of the full /models dump which returns hundreds of models.
             from hermes_cli.models import _PROVIDER_MODELS
             model_ids = _PROVIDER_MODELS.get("nous", [])
 
