@@ -989,6 +989,118 @@ def run_doctor(args):
         pass
 
     # =========================================================================
+    # Dependent Services (services.d)
+    # =========================================================================
+    print()
+    print(color("◆ Dependent Services", Colors.CYAN, Colors.BOLD))
+
+    services_dir = HERMES_HOME / "services.d"
+    if not services_dir.is_dir():
+        check_info(f"No services.d directory — dependent services are not monitored yet")
+        check_info(f"Create ~/.hermes/services.d/ with YAML service descriptors to add checks here")
+    else:
+        import yaml
+        import subprocess
+        import time
+
+        service_files = sorted([f for f in services_dir.iterdir() if f.suffix == ".yaml"])
+        if not service_files:
+            check_info("services.d is empty — no services configured")
+        else:
+            ok_count = 0
+            warn_count = 0
+            fail_count = 0
+
+            for svc_file in service_files:
+                try:
+                    with open(svc_file) as f:
+                        svc = yaml.safe_load(f)
+                except Exception as e:
+                    check_warn(f"{svc_file.stem}", f"(failed to load: {e})")
+                    continue
+
+                name = svc.get("name", svc_file.stem)
+                desc = svc.get("description", "")
+                health = svc.get("health_check", {})
+                status_map = svc.get("status", {})
+                detail = svc.get("detail_check", {})
+
+                # Run health check command
+                cmd = health.get("command", "")
+                timeout = health.get("timeout", 5)
+                if not cmd:
+                    check_warn(name, "(no health_check.command defined)")
+                    continue
+
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                    rc = result.returncode
+                except subprocess.TimeoutExpired:
+                    rc = -1
+                except Exception:
+                    rc = -2
+
+                # Determine status: 0 = ok, else fail
+                if rc == 0:
+                    status = "ok"
+                    status_color = Colors.GREEN
+                    status_icon = color("✓", Colors.GREEN)
+                    ok_count += 1
+                else:
+                    status = "fail"
+                    status_color = Colors.RED
+                    status_icon = color("✗", Colors.RED)
+                    fail_count += 1
+                    issues.append(f"{name}: {status_map.get('fail', 'health check failed')}")
+
+                status_text = status_map.get(status, f"health_check exited {rc}")
+                print(f"  {status_icon} {color(name, status_color)} — {status_text}")
+                if desc:
+                    check_info(desc)
+
+                # Optional detail check (only runs when health_check passes)
+                if detail and status == "ok":
+                    detail_cmd = detail.get("command", "")
+                    detail_timeout = detail.get("timeout", 10)
+                    detail_when = detail.get("when", "")
+                    detail_label = detail.get("label", "detail check")
+
+                    if detail_when == "health_check ok" and detail_cmd:
+                        try:
+                            d_result = subprocess.run(
+                                detail_cmd,
+                                shell=True,
+                                capture_output=True,
+                                text=True,
+                                timeout=detail_timeout,
+                            )
+                            detail_output = d_result.stdout.strip() or d_result.stderr.strip()
+                            if d_result.returncode == 0 and detail_output:
+                                check_ok(detail_label, detail_output[:60])
+                            elif detail_output:
+                                check_warn(detail_label, detail_output[:60])
+                        except subprocess.TimeoutExpired:
+                            check_warn(detail_label, "(timed out)")
+                        except Exception:
+                            pass
+
+            if ok_count > 0 or fail_count > 0:
+                summary_parts = []
+                if ok_count:
+                    summary_parts.append(f"{ok_count} ok")
+                if fail_count:
+                    summary_parts.append(f"{fail_count} failing")
+                print()
+                check_info(f"Total: {', '.join(summary_parts)}")
+                print()
+
+    # =========================================================================
     # Summary
     # =========================================================================
     print()
