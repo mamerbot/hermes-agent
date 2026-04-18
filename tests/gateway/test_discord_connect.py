@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,12 +31,17 @@ def _ensure_discord_mock():
     )
     discord_mod.opus = SimpleNamespace(is_loaded=lambda: True)
 
+    errors_mod = ModuleType("discord.errors")
+    errors_mod.PrivilegedIntentsRequired = type("PrivilegedIntentsRequired", (Exception,), {})
+    discord_mod.errors = errors_mod
+
     ext_mod = MagicMock()
     commands_mod = MagicMock()
     commands_mod.Bot = MagicMock
     ext_mod.commands = commands_mod
 
     sys.modules.setdefault("discord", discord_mod)
+    sys.modules.setdefault("discord.errors", errors_mod)
     sys.modules.setdefault("discord.ext", ext_mod)
     sys.modules.setdefault("discord.ext.commands", commands_mod)
 
@@ -50,6 +55,9 @@ from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 class FakeTree:
     def __init__(self):
         self.sync = AsyncMock(return_value=[])
+
+    def get_commands(self):
+        return []
 
     def command(self, *args, **kwargs):
         return lambda fn: fn
@@ -94,6 +102,14 @@ class SlowSyncBot(FakeBot):
         self.tree = SlowSyncTree()
 
 
+class FailingBot(FakeBot):
+    def __init__(self, *, intents, proxy=None):
+        super().__init__(intents=intents, proxy=proxy)
+
+    async def start(self, token):
+        raise discord_platform.PrivilegedIntentsRequired("missing privileged intents")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("allowed_users", "expected_members_intent"),
@@ -131,6 +147,34 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
 
 
 @pytest.mark.asyncio
+async def test_connect_can_disable_message_content_intent(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setenv("DISCORD_MESSAGE_CONTENT_INTENT", "false")
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=True, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+
+    created = {}
+
+    def fake_bot_factory(*, command_prefix, intents, proxy=None):
+        created["bot"] = FakeBot(intents=intents)
+        return created["bot"]
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    ok = await adapter.connect()
+
+    assert ok is True
+    assert created["bot"].intents.message_content is False
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_connect_releases_token_lock_on_timeout(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
@@ -147,11 +191,12 @@ async def test_connect_releases_token_lock_on_timeout(monkeypatch):
         lambda **kwargs: FakeBot(intents=kwargs["intents"], proxy=kwargs.get("proxy")),
     )
 
-    async def fake_wait_for(awaitable, timeout):
-        awaitable.close()
+    async def fake_wait(awaitables, timeout=None, return_when=None):
+        for task in awaitables:
+            task.cancel()
         raise asyncio.TimeoutError()
 
-    monkeypatch.setattr(discord_platform.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(discord_platform.asyncio, "wait", fake_wait)
 
     ok = await adapter.connect()
 
@@ -191,3 +236,29 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
     created["bot"].tree.allow_finish.set()
     await asyncio.sleep(0)
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_surfaces_privileged_intents_failure(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+
+    created = {}
+
+    def fake_bot_factory(*, command_prefix, intents, proxy=None):
+        bot = FailingBot(intents=intents, proxy=proxy)
+        created["bot"] = bot
+        return bot
+
+    monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+
+    ok = await asyncio.wait_for(adapter.connect(), timeout=1.0)
+
+    assert ok is False
+    assert created["bot"].intents.message_content is True

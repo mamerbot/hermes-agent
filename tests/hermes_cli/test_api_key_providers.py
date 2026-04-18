@@ -265,11 +265,12 @@ class TestResolveProvider:
         monkeypatch.setenv("HF_TOKEN", "hf_test_token")
         assert resolve_provider("auto") == "huggingface"
 
-    def test_openrouter_takes_priority_over_glm(self, monkeypatch):
-        """OpenRouter API key should win over GLM in auto-detection."""
+    def test_nous_takes_priority_over_openrouter_and_glm(self, monkeypatch):
+        """Nous Portal should win over OpenRouter in auto-detection."""
+        monkeypatch.setenv("NOUS_PORTAL_API_KEY", "nous-key")
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         monkeypatch.setenv("GLM_API_KEY", "glm-key")
-        assert resolve_provider("auto") == "openrouter"
+        assert resolve_provider("auto") == "nous"
 
     def test_auto_does_not_select_copilot_from_github_token(self, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")

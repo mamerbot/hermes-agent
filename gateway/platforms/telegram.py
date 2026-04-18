@@ -193,6 +193,30 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
         return isinstance(error, OSError)
 
+    @staticmethod
+    def _looks_like_telegram_auth_error(error: Exception) -> bool:
+        """Return True for Telegram auth/permission failures that should not retry."""
+        name = error.__class__.__name__.lower()
+        if name in {"unauthorized", "invalidtoken", "forbidden"}:
+            return True
+
+        status_code = getattr(error, "status_code", None)
+        if status_code == 401:
+            return True
+
+        err_str = str(error).lower()
+        if "unauthorized" in err_str or "invalid token" in err_str:
+            return True
+
+        try:
+            from telegram.error import Forbidden, InvalidToken, Unauthorized
+            if isinstance(error, (Forbidden, InvalidToken, Unauthorized)):
+                return True
+        except Exception:
+            pass
+
+        return False
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -612,6 +636,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._app.initialize()
                     break
                 except (NetworkError, TimedOut, OSError) as init_err:
+                    if self._looks_like_telegram_auth_error(init_err):
+                        raise
                     if _attempt < _max_connect - 1:
                         wait = 2 ** _attempt
                         logger.warning(
@@ -725,8 +751,15 @@ class TelegramAdapter(BasePlatformAdapter):
             
         except Exception as e:
             self._release_platform_lock()
-            message = f"Telegram startup failed: {e}"
-            self._set_fatal_error("telegram_connect_error", message, retryable=True)
+            if self._looks_like_telegram_auth_error(e):
+                message = (
+                    "Telegram startup failed: bot token was rejected (401 Unauthorized). "
+                    "Check TELEGRAM_BOT_TOKEN / BotFather token and restart."
+                )
+                self._set_fatal_error("telegram_auth_error", message, retryable=False)
+            else:
+                message = f"Telegram startup failed: {e}"
+                self._set_fatal_error("telegram_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
     
@@ -864,6 +897,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 raise
                         break  # success
                     except _NetErr as send_err:
+                        if self._looks_like_telegram_auth_error(send_err):
+                            raise
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle
@@ -934,7 +969,8 @@ class TelegramAdapter(BasePlatformAdapter):
             _to = locals().get("_TimedOut")
             err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
-            return SendResult(success=False, error=str(e), retryable=not is_timeout)
+            is_auth = self._looks_like_telegram_auth_error(e)
+            return SendResult(success=False, error=str(e), retryable=not (is_timeout or is_auth))
 
     async def edit_message(
         self,
@@ -1019,6 +1055,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
+            if self._looks_like_telegram_auth_error(e):
+                return SendResult(success=False, error=str(e), retryable=False)
             return SendResult(success=False, error=str(e))
 
     async def send_update_prompt(

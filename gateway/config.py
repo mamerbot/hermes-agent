@@ -744,6 +744,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if telegram_token is not None:
+        telegram_token = telegram_token.strip()
     if telegram_token:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()

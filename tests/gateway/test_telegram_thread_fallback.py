@@ -37,6 +37,10 @@ class FakeTimedOut(FakeNetworkError):
     pass
 
 
+class FakeUnauthorized(Exception):
+    pass
+
+
 class FakeRetryAfter(Exception):
     def __init__(self, seconds):
         super().__init__(f"Retry after {seconds}")
@@ -49,6 +53,7 @@ _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest
 _fake_telegram_error.TimedOut = FakeTimedOut
+_fake_telegram_error.Unauthorized = FakeUnauthorized
 _fake_telegram.error = _fake_telegram_error
 _fake_telegram_constants = types.ModuleType("telegram.constants")
 _fake_telegram_constants.ParseMode = SimpleNamespace(MARKDOWN_V2="MarkdownV2")
@@ -204,6 +209,32 @@ async def test_send_does_not_retry_timeout():
     assert result.success is False
     assert "Timed out" in result.error
     # CRITICAL: only 1 attempt — no retry for TimedOut
+    assert attempt[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_send_marks_unauthorized_as_non_retryable():
+    """401/Unauthorized errors should fail fast and not be retried."""
+    adapter = _make_adapter()
+
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        err = FakeUnauthorized("401 Unauthorized: bot token was revoked")
+        err.status_code = 401
+        raise err
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert "Unauthorized" in result.error or "401" in result.error
     assert attempt[0] == 1
 
 

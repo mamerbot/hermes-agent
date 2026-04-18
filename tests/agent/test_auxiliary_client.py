@@ -327,7 +327,7 @@ class TestExpiredCodexFallback:
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
             assert client is not None
-            # OpenRouter is 1st in chain, should win
+            # OpenRouter should still win when Nous isn't available
             mock_openai.assert_called()
 
     def test_expired_codex_custom_endpoint_wins(self, tmp_path, monkeypatch):
@@ -1012,14 +1012,14 @@ class TestGetProviderChain:
         chain = _get_provider_chain()
         assert len(chain) == 5
         labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "nous", "local/custom", "openai-codex", "api-key"]
+        assert labels == ["nous", "openrouter", "local/custom", "openai-codex", "api-key"]
 
     def test_picks_up_patched_functions(self):
         """Patches on _try_* functions must be visible in the chain."""
         sentinel = lambda: ("patched", "model")
-        with patch("agent.auxiliary_client._try_openrouter", sentinel):
+        with patch("agent.auxiliary_client._try_nous", sentinel):
             chain = _get_provider_chain()
-        assert chain[0] == ("openrouter", sentinel)
+        assert chain[0] == ("nous", sentinel)
 
 
 class TestTryPaymentFallback:

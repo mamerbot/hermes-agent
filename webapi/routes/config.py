@@ -37,24 +37,40 @@ async def get_web_config() -> ConfigResponse:
 
 @router.patch("")
 async def patch_web_config(patch: ConfigPatch) -> dict[str, Any]:
-    """Patch ~/.hermes/config.yaml with the provided fields.
-    Only model, provider, and base_url are exposed — everything else
-    (toolsets, memory, display, etc.) is left untouched.
+    """Patch ~/.hermes/config.yaml with the provided model fields.
+    Persist settings into the nested `model:` mapping used by current Hermes
+    config, while preserving older string-style configs when possible.
     """
     try:
         config = load_config()
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, dict):
+            next_model = dict(model_cfg)
+        elif isinstance(model_cfg, str) and model_cfg.strip():
+            next_model = {"default": model_cfg.strip()}
+        else:
+            next_model = {}
 
         if patch.model is not None:
-            config["model"] = patch.model
+            next_model["default"] = patch.model
         if patch.provider is not None:
-            config["provider"] = patch.provider
+            if patch.provider.strip():
+                next_model["provider"] = patch.provider.strip()
+            else:
+                next_model.pop("provider", None)
         if patch.base_url is not None:
             if patch.base_url.strip():
-                config["base_url"] = patch.base_url.strip()
+                next_model["base_url"] = patch.base_url.strip()
             else:
-                config.pop("base_url", None)  # empty string = remove it
+                next_model.pop("base_url", None)
 
+        config["model"] = next_model
         save_config(config)
-        return {"ok": True, "model": config.get("model"), "provider": config.get("provider"), "base_url": config.get("base_url")}
+        return {
+            "ok": True,
+            "model": next_model.get("default"),
+            "provider": next_model.get("provider"),
+            "base_url": next_model.get("base_url"),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

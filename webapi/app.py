@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from webapi.errors import register_error_handlers
+from webapi.routes.chat import compat_router as compat_chat_router
 from webapi.routes.chat import router as chat_router
 from webapi.routes.config import router as config_router
 from webapi.routes.health import router as health_router
@@ -11,6 +12,7 @@ from webapi.routes.memory import router as memory_router
 from webapi.routes.models import router as models_router
 from webapi.routes.sessions import router as sessions_router
 from webapi.routes.skills import router as skills_router
+from webapi.routes.jobs import router as jobs_router
 
 # Default origins cover common local dev ports (3000-3010) + any explicitly
 # configured origin via HERMES_CORS_ORIGINS (comma-separated).
@@ -42,10 +44,12 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(models_router)
+    app.include_router(compat_chat_router)
     app.include_router(sessions_router)
     app.include_router(chat_router)
     app.include_router(memory_router)
     app.include_router(skills_router)
+    app.include_router(jobs_router)
     app.include_router(config_router)
 
     return app

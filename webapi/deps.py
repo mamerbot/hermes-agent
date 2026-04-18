@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from hermes_cli.config import load_config
+from hermes_cli.runtime_provider import format_runtime_provider_error, resolve_runtime_provider
 
 def _extract_model_string(model_value) -> str:
     """Extract the model string from config, handling both str and dict formats.
@@ -32,16 +33,43 @@ def _extract_provider_string(config: dict) -> str:
 
 
 try:
-    from gateway.run import _resolve_model, _resolve_runtime_agent_kwargs
+    from gateway.run import _resolve_runtime_agent_kwargs as _gateway_resolve_runtime_agent_kwargs
 except ImportError:
-    def _resolve_model() -> str:
-        config = load_config()
-        raw = config.get("model", os.getenv("HERMES_MODEL", "claude-sonnet-4-5"))
-        return _extract_model_string(raw) or "claude-sonnet-4-5"
+    _gateway_resolve_runtime_agent_kwargs = None
 
-    def _resolve_runtime_agent_kwargs() -> dict:
-        config = load_config()
-        return {"provider": _extract_provider_string(config)}
+
+def _resolve_model() -> str:
+    """Default model id for webapi agents — always a string (never the raw model dict)."""
+    config = load_config()
+    model_cfg = config.get("model")
+    if isinstance(model_cfg, dict):
+        name = model_cfg.get("default") or model_cfg.get("model") or ""
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    if isinstance(model_cfg, str) and model_cfg.strip():
+        return model_cfg.strip()
+    return os.getenv("HERMES_MODEL", "claude-sonnet-4-5")
+
+
+def _resolve_runtime_agent_kwargs() -> dict[str, Any]:
+    if _gateway_resolve_runtime_agent_kwargs is not None:
+        return _gateway_resolve_runtime_agent_kwargs()
+    try:
+        runtime = resolve_runtime_provider(
+            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+        )
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+    return {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+    }
+
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tools.memory_tool import MemoryStore
@@ -104,7 +132,10 @@ def create_agent(
     step_callback=None,
 ) -> AIAgent:
     runtime_kwargs = get_runtime_agent_kwargs()
-    effective_model = model or get_runtime_model()
+    raw = model or get_runtime_model()
+    if isinstance(raw, dict):
+        raw = raw.get("default") or raw.get("model") or ""
+    effective_model = (raw if isinstance(raw, str) else str(raw)).strip() or _resolve_model()
     max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
     return AIAgent(

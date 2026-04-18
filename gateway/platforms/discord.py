@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from contextlib import suppress
 from pathlib import Path
 from typing import Callable, Dict, Optional, Any
 
@@ -30,6 +31,7 @@ try:
     import discord
     from discord import Message as DiscordMessage, Intents
     from discord.ext import commands
+    from discord.errors import PrivilegedIntentsRequired
     DISCORD_AVAILABLE = True
 except ImportError:
     DISCORD_AVAILABLE = False
@@ -37,6 +39,7 @@ except ImportError:
     DiscordMessage = Any
     Intents = Any
     commands = None
+    PrivilegedIntentsRequired = type("PrivilegedIntentsRequired", (Exception,), {})
 
 import sys
 from pathlib import Path as _Path
@@ -75,6 +78,14 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var with a forgiving default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def check_discord_requirements() -> bool:
@@ -520,11 +531,17 @@ class DiscordAdapter(BasePlatformAdapter):
             # bot from coming online at all, so avoid requesting members intent
             # unless it is actually necessary.
             intents = Intents.default()
-            intents.message_content = True
+            intents.message_content = _env_bool("DISCORD_MESSAGE_CONTENT_INTENT", True)
             intents.dm_messages = True
             intents.guild_messages = True
             intents.members = any(not entry.isdigit() for entry in self._allowed_user_ids)
             intents.voice_states = True
+
+            if not intents.message_content:
+                logger.warning(
+                    "[%s] Discord Message Content Intent is disabled; raw message replies will be unavailable and slash commands will be the primary interface",
+                    self.name,
+                )
 
             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
@@ -657,14 +674,45 @@ class DiscordAdapter(BasePlatformAdapter):
             # Start the bot in background
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
 
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+            # Wait for either readiness or a startup failure from the background task.
+            ready_wait = asyncio.create_task(self._ready_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {ready_wait, self._bot_task},
+                    timeout=30,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if self._bot_task in done:
+                    exc = self._bot_task.exception()
+                    if exc is not None:
+                        raise exc
+                    if not self._ready_event.is_set():
+                        raise RuntimeError("Discord client exited before becoming ready")
+
+                if not self._ready_event.is_set():
+                    raise asyncio.TimeoutError()
+            finally:
+                if not ready_wait.done():
+                    ready_wait.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await ready_wait
 
             self._running = True
             return True
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            self._release_platform_lock()
+            return False
+        except PrivilegedIntentsRequired as e:
+            logger.error(
+                "[%s] Discord privileged intents are not enabled in the Developer Portal: %s. "
+                "Enable Message Content Intent and, if needed, Server Members Intent; or set DISCORD_MESSAGE_CONTENT_INTENT=false for slash-command-only mode.",
+                self.name,
+                e,
+                exc_info=True,
+            )
             self._release_platform_lock()
             return False
         except Exception as e:  # pragma: no cover - defensive logging

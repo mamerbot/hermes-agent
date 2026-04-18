@@ -1,10 +1,12 @@
 import json
 import threading
+import time
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from hermes_state import SessionDB
@@ -14,6 +16,74 @@ from webapi.sse import SSEEmitter, SSEStream
 
 
 router = APIRouter(prefix="/api/sessions", tags=["chat"])
+compat_router = APIRouter(tags=["chat"])
+
+
+class OpenAICompatMessage(BaseModel):
+    role: str
+    content: Any
+
+
+class OpenAICompatChatRequest(BaseModel):
+    model: str | None = None
+    messages: list[OpenAICompatMessage] = Field(default_factory=list)
+    stream: bool = False
+    temperature: float | None = None
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _to_openai_history(messages: list[OpenAICompatMessage]) -> tuple[list[dict[str, Any]], str]:
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages must not be empty")
+
+    history: list[dict[str, Any]] = []
+    user_message = ""
+
+    for idx, message in enumerate(messages):
+        role = (message.role or "").strip()
+        if not role:
+            continue
+        text = _content_to_text(message.content)
+        if idx == len(messages) - 1:
+            if role != "user":
+                raise HTTPException(status_code=400, detail="last message must have role='user'")
+            user_message = text
+        else:
+            history.append({"role": role, "content": text})
+
+    return history, user_message
+
+
+def _openai_response_payload(*, model: str, content: str) -> dict[str, Any]:
+    now = int(time.time())
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": now,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
 
 def _read_attachment_field(attachment: Any, *keys: str) -> str:
@@ -210,6 +280,99 @@ def _run_chat(
         user_content,
         conversation_history=history,
         persist_user_message=persist_text,
+    )
+
+
+def _run_openai_chat(
+    *,
+    payload: OpenAICompatChatRequest,
+    session_db: SessionDB,
+    stream_callback=None,
+) -> dict[str, Any]:
+    history, user_message = _to_openai_history(payload.messages)
+    session_id = f"openai_{uuid.uuid4().hex}"
+    agent = create_agent(
+        session_id=session_id,
+        session_db=session_db,
+        model=payload.model,
+    )
+    return agent.run_conversation(
+        user_message,
+        conversation_history=history,
+        persist_user_message=user_message,
+        stream_callback=stream_callback,
+    )
+
+
+@compat_router.post("/v1/chat/completions")
+async def openai_chat_completions(
+    payload: OpenAICompatChatRequest,
+    request: Request,
+    session_db: Annotated[SessionDB, Depends(get_session_db)],
+):
+    effective_model = payload.model or get_runtime_model()
+
+    if request.headers.get("X-Hermes-Probe", "").strip() == "1":
+        return _openai_response_payload(model=effective_model, content="ok")
+
+    if payload.stream:
+        stream = SSEStream()
+
+        def _stream_worker() -> None:
+            try:
+                def _on_delta(delta: str) -> None:
+                    if not delta:
+                        return
+                    chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": effective_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": delta},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    stream.put(f"data: {json.dumps(chunk)}\n\n")
+
+                _run_openai_chat(
+                    payload=payload,
+                    session_db=session_db,
+                    stream_callback=_on_delta,
+                )
+
+                final_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": effective_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                stream.put(f"data: {json.dumps(final_chunk)}\n\n")
+                stream.put("data: [DONE]\n\n")
+            except Exception as exc:
+                error_chunk = {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                    }
+                }
+                stream.put(f"data: {json.dumps(error_chunk)}\n\n")
+            finally:
+                stream.close()
+
+        threading.Thread(target=_stream_worker, daemon=True).start()
+        return StreamingResponse(stream.generator(), media_type="text/event-stream")
+
+    result = await run_in_threadpool(_run_openai_chat, payload=payload, session_db=session_db)
+    if result.get("error") and not result.get("final_response"):
+        raise HTTPException(status_code=500, detail=result["error"])
+    return _openai_response_payload(
+        model=effective_model,
+        content=result.get("final_response") or "",
     )
 
 

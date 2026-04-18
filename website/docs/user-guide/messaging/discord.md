@@ -109,7 +109,7 @@ If you prefer to keep your bot private (Public Bot = OFF), you **must** use the 
 
 ## Step 3: Enable Privileged Gateway Intents
 
-This is the most critical step in the entire setup. Without the correct intents enabled, your bot will connect to Discord but **will not be able to read message content**.
+This is the most critical step in the entire setup. Without the correct intents enabled, your bot will connect to Discord but **will not be able to read message content**. If you intentionally want slash-command-only mode, set `DISCORD_MESSAGE_CONTENT_INTENT=false` in the environment.
 
 On the **Bot** page, scroll down to **Privileged Gateway Intents**. You'll see three toggles:
 

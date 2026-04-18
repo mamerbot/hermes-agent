@@ -253,6 +253,62 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
+class _ACPResponsesStream:
+    def __init__(self, client: "CopilotACPClient", kwargs: dict[str, Any]):
+        self._client = client
+        self._kwargs = dict(kwargs)
+        self._final_response: Any = None
+        self._events: list[Any] | None = None
+
+    def __enter__(self) -> "_ACPResponsesStream":
+        self._ensure_built()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def __iter__(self):
+        self._ensure_built()
+        return iter(self._events or [])
+
+    def close(self) -> None:
+        self._client.close()
+
+    def get_final_response(self) -> Any:
+        self._ensure_built()
+        return self._final_response
+
+    def _ensure_built(self) -> None:
+        if self._final_response is not None:
+            return
+        response_text, reasoning_text = self._client._run_prompt_for_responses(self._kwargs)
+        self._final_response = self._client._build_responses_response(response_text, reasoning_text, self._kwargs)
+        events: list[Any] = []
+        text_chunks = self._client._split_text_for_streaming(response_text)
+        for chunk in text_chunks:
+            events.append(SimpleNamespace(type="response.output_text.delta", delta=chunk))
+        if reasoning_text:
+            for chunk in self._client._split_text_for_streaming(reasoning_text):
+                events.append(SimpleNamespace(type="response.reasoning.delta", delta=chunk))
+        events.append(SimpleNamespace(type="response.completed", response=self._final_response))
+        self._events = events
+
+
+class _ACPResponsesNamespace:
+    def __init__(self, client: "CopilotACPClient"):
+        self._client = client
+
+    def stream(self, **kwargs: Any) -> _ACPResponsesStream:
+        return _ACPResponsesStream(self._client, kwargs)
+
+    def create(self, **kwargs: Any) -> Any:
+        if kwargs.get("stream"):
+            return _ACPResponsesStream(self._client, kwargs)
+        response_text, reasoning_text = self._client._run_prompt_for_responses(kwargs)
+        return self._client._build_responses_response(response_text, reasoning_text, kwargs)
+
+
 class CopilotACPClient:
     """Minimal OpenAI-client-compatible facade for Copilot ACP."""
 
@@ -276,6 +332,7 @@ class CopilotACPClient:
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
+        self.responses = _ACPResponsesNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
@@ -339,6 +396,79 @@ class CopilotACPClient:
             choices=[choice],
             usage=usage,
             model=model or "copilot-acp",
+        )
+
+    def _split_text_for_streaming(self, text: str, *, chunk_size: int = 120) -> list[str]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+        if len(cleaned) <= chunk_size:
+            return [cleaned]
+        chunks: list[str] = []
+        start = 0
+        while start < len(cleaned):
+            end = min(len(cleaned), start + chunk_size)
+            if end < len(cleaned):
+                split_at = cleaned.rfind(" ", start, end)
+                if split_at > start:
+                    end = split_at
+            chunk = cleaned[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = end
+        return chunks or [cleaned]
+
+    def _extract_responses_prompt(self, kwargs: dict[str, Any]) -> tuple[str, str | None]:
+        model = kwargs.get("model")
+        instructions = kwargs.get("instructions")
+        input_value = kwargs.get("input")
+        messages: list[dict[str, Any]] = []
+        if isinstance(instructions, str) and instructions.strip():
+            messages.append({"role": "system", "content": instructions})
+        if isinstance(input_value, list):
+            for item in input_value:
+                if isinstance(item, dict):
+                    messages.append(item)
+        elif isinstance(input_value, str):
+            messages.append({"role": "user", "content": input_value})
+        elif input_value is not None:
+            messages.append({"role": "user", "content": json.dumps(input_value, ensure_ascii=True)})
+        prompt_text = _format_messages_as_prompt(messages, model=model)
+        timeout_value = kwargs.get("timeout")
+        if isinstance(timeout_value, (int, float)):
+            timeout_seconds = float(timeout_value)
+        else:
+            timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
+        return prompt_text, timeout_seconds
+
+    def _run_prompt_for_responses(self, kwargs: dict[str, Any]) -> tuple[str, str]:
+        prompt_text, timeout_seconds = self._extract_responses_prompt(kwargs)
+        return self._run_prompt(prompt_text, timeout_seconds=timeout_seconds)
+
+    def _build_responses_response(self, response_text: str, reasoning_text: str, kwargs: dict[str, Any]) -> Any:
+        output_parts = [SimpleNamespace(type="output_text", text=response_text or "")]
+        message_item = SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=output_parts,
+        )
+        output_items: list[Any] = [message_item]
+        if reasoning_text:
+            output_items.append(SimpleNamespace(type="reasoning", summary=[SimpleNamespace(text=reasoning_text)], text=reasoning_text))
+        usage = SimpleNamespace(
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+        )
+        final_text = response_text or ""
+        return SimpleNamespace(
+            id=f"acp_{int(time.time() * 1000)}",
+            status="completed",
+            model=kwargs.get("model") or "copilot-acp",
+            output=output_items,
+            output_text=final_text,
+            usage=usage,
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:

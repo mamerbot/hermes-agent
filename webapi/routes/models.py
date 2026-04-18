@@ -11,6 +11,7 @@ router = APIRouter()
 @router.get("/v1/models")
 async def list_models() -> dict:
     runtime_model = get_runtime_model()
+    runtime_model_id = runtime_model if isinstance(runtime_model, str) else str(runtime_model)
     now = int(time.time())
     return {
         "object": "list",
@@ -26,12 +27,12 @@ async def list_models() -> dict:
                 "runtime_model": runtime_model,
             },
             {
-                "id": runtime_model,
+                "id": runtime_model_id,
                 "object": "model",
                 "created": now,
                 "owned_by": "runtime",
                 "permission": [],
-                "root": runtime_model,
+                "root": runtime_model_id,
                 "parent": "hermes-agent",
             },
         ],

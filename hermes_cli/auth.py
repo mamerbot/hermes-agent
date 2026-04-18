@@ -888,9 +888,10 @@ def resolve_provider(
     Priority (when requested="auto" or None):
     1. active_provider in auth.json with valid credentials
     2. Explicit CLI api_key/base_url -> "openrouter"
-    3. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
-    4. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
-    5. Fallback: "openrouter"
+    3. NOUS_PORTAL_API_KEY / Nous auth -> "nous"
+    4. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
+    5. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
+    6. Fallback: "openrouter"
     """
     normalized = (requested or "auto").strip().lower()
 
@@ -950,6 +951,9 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
 
+    if has_usable_secret(os.getenv("NOUS_PORTAL_API_KEY")):
+        return "nous"
+
     if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
@@ -968,8 +972,8 @@ def resolve_provider(
 
     raise AuthError(
         "No inference provider configured. Run 'hermes model' to choose a "
-        "provider and model, or set an API key (OPENROUTER_API_KEY, "
-        "OPENAI_API_KEY, etc.) in ~/.hermes/.env.",
+        "provider and model, or set an API key (NOUS_PORTAL_API_KEY, "
+        "OPENROUTER_API_KEY, OPENAI_API_KEY, etc.) in ~/.hermes/.env.",
         code="no_provider_configured",
     )
 

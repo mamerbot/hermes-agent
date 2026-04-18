@@ -395,6 +395,19 @@ class TestConfigFallbackIps:
         assert "fallback_ips" not in config.platforms[Platform.TELEGRAM].extra
 
 
+class TestTelegramTokenOverrides:
+    def test_env_token_is_stripped_before_use(self, monkeypatch):
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "  123456:ABCdefGHIjklMNOpqrSTUvwxYZ  ")
+        config = GatewayConfig(platforms={})
+        _apply_env_overrides(config)
+
+        assert Platform.TELEGRAM in config.platforms
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+        assert config.platforms[Platform.TELEGRAM].token == "123456:ABCdefGHIjklMNOpqrSTUvwxYZ"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Adapter layer – _fallback_ips() reads config correctly
 # ═══════════════════════════════════════════════════════════════════════════

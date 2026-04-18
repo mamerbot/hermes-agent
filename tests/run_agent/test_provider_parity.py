@@ -672,13 +672,14 @@ class TestBuildAssistantMessage:
 class TestAuxiliaryClientProviderPriority:
     """Verify auxiliary client resolution doesn't break for any provider."""
 
-    def test_openrouter_always_wins(self, monkeypatch):
+    def test_nous_wins_over_openrouter_when_available(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         from agent.auxiliary_client import get_text_auxiliary_client
-        with patch("agent.auxiliary_client.OpenAI") as mock:
+        with patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "nous-key"}), \
+             patch("agent.auxiliary_client.OpenAI") as mock:
             client, model = get_text_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
-        assert "openrouter" in str(mock.call_args.kwargs["base_url"]).lower()
+        assert "nousresearch" in str(mock.call_args.kwargs["base_url"]).lower()
 
     def test_nous_when_no_openrouter(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
