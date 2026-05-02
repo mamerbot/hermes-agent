@@ -3,20 +3,20 @@ import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'rea
 
 import type { PasteEvent } from '../components/textInput.js'
 import type { GatewayClient } from '../gatewayClient.js'
+import type { ImageAttachResponse } from '../gatewayTypes.js'
 import type { RpcResult } from '../lib/rpc.js'
 import type { Theme } from '../theme.js'
 import type {
-  ActiveTool,
-  ActivityItem,
   ApprovalReq,
   ClarifyReq,
+  ConfirmReq,
   DetailsMode,
   Msg,
   PanelSection,
   SecretReq,
+  SectionVisibility,
   SessionInfo,
   SlashCatalog,
-  SubagentProgress,
   SudoReq,
   Usage
 } from '../types.js'
@@ -25,9 +25,27 @@ export interface StateSetter<T> {
   (value: SetStateAction<T>): void
 }
 
+export type StatusBarMode = 'bottom' | 'off' | 'top'
+
+export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
+
+// Single source of truth for indicator style names.  Union type is
+// derived from this tuple so adding/removing a style only touches one
+// line — `useConfigSync` (validation) and `session.ts` (slash arg
+// validation + usage hint) both import it.
+export const INDICATOR_STYLES = ['ascii', 'emoji', 'kaomoji', 'unicode'] as const
+export type IndicatorStyle = (typeof INDICATOR_STYLES)[number]
+export const DEFAULT_INDICATOR_STYLE: IndicatorStyle = 'kaomoji'
+
 export interface SelectionApi {
+  captureScrolledRows: (firstRow: number, lastRow: number, side: 'above' | 'below') => void
   clearSelection: () => void
-  copySelection: () => string
+  copySelection: () => Promise<string>
+  copySelectionNoClear: () => Promise<string>
+  getState: () => unknown
+  version: () => number
+  shiftAnchor: (dRow: number, minRow: number, maxRow: number) => void
+  shiftSelection: (dRow: number, minRow: number, maxRow: number) => void
 }
 
 export interface CompletionItem {
@@ -51,12 +69,16 @@ export interface GatewayProviderProps {
 }
 
 export interface OverlayState {
+  agents: boolean
+  agentsInitialHistoryIndex: number
   approval: ApprovalReq | null
   clarify: ClarifyReq | null
+  confirm: ConfirmReq | null
   modelPicker: boolean
   pager: null | PagerState
   picker: boolean
   secret: null | SecretReq
+  skillsHub: boolean
   sudo: null | SudoReq
 }
 
@@ -75,12 +97,21 @@ export interface TranscriptRow {
 export interface UiState {
   bgTasks: Set<string>
   busy: boolean
+  busyInputMode: BusyInputMode
   compact: boolean
   detailsMode: DetailsMode
+  detailsModeCommandOverride: boolean
   info: null | SessionInfo
+  inlineDiffs: boolean
+  mouseTracking: boolean
+  sections: SectionVisibility
+  showCost: boolean
+  showReasoning: boolean
+  indicatorStyle: IndicatorStyle
   sid: null | string
   status: string
-  statusBar: boolean
+  statusBar: StatusBarMode
+  streaming: boolean
   theme: Theme
   usage: Usage
 }
@@ -99,13 +130,16 @@ export interface ComposerPasteResult {
   value: string
 }
 
+export type MaybePromise<T> = Promise<T> | T
+
 export interface ComposerActions {
   clearIn: () => void
   dequeue: () => string | undefined
   enqueue: (text: string) => void
-  handleTextPaste: (event: PasteEvent) => ComposerPasteResult | null
-  openEditor: () => void
+  handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
+  openEditor: () => Promise<void>
   pushHistory: (text: string) => void
+  removeQueue: (index: number) => void
   replaceQueue: (index: number, text: string) => void
   setCompIdx: StateSetter<number>
   setHistoryIdx: StateSetter<null | number>
@@ -139,6 +173,7 @@ export interface ComposerState {
 export interface UseComposerStateOptions {
   gw: GatewayClient
   onClipboardPaste: (quiet?: boolean) => Promise<void> | void
+  onImageAttached?: (info: ImageAttachResponse) => void
   submitRef: MutableRefObject<(value: string) => void>
 }
 
@@ -174,9 +209,11 @@ export interface InputHandlerContext {
     stdout?: NodeJS.WriteStream
   }
   voice: {
+    enabled: boolean
     recording: boolean
     setProcessing: StateSetter<boolean>
     setRecording: StateSetter<boolean>
+    setVoiceEnabled: StateSetter<boolean>
   }
   wheelStep: number
 }
@@ -187,9 +224,7 @@ export interface InputHandlerResult {
 
 export interface GatewayEventHandlerContext {
   composer: {
-    dequeue: () => string | undefined
-    queueEditRef: MutableRefObject<null | number>
-    sendQueued: (text: string) => void
+    setInput: StateSetter<string>
   }
   gateway: GatewayServices
   session: {
@@ -200,6 +235,9 @@ export interface GatewayEventHandlerContext {
     resumeById: (id: string) => void
     setCatalog: StateSetter<null | SlashCatalog>
   }
+  submission: {
+    submitRef: MutableRefObject<(value: string) => void>
+  }
   system: {
     bellOnComplete: boolean
     stdout?: NodeJS.WriteStream
@@ -209,6 +247,11 @@ export interface GatewayEventHandlerContext {
     appendMessage: (msg: Msg) => void
     panel: (title: string, sections: PanelSection[]) => void
     setHistoryItems: StateSetter<Msg[]>
+  }
+  voice: {
+    setProcessing: StateSetter<boolean>
+    setRecording: StateSetter<boolean>
+    setVoiceEnabled: StateSetter<boolean>
   }
 }
 
@@ -256,6 +299,7 @@ export interface AppLayoutActions {
   answerClarify: (answer: string) => void
   answerSecret: (value: string) => void
   answerSudo: (pw: string) => void
+  clearSelection: () => void
   onModelSelect: (value: string) => void
   resumeById: (id: string) => void
   setStickyPrompt: (value: string) => void
@@ -266,7 +310,7 @@ export interface AppLayoutComposerProps {
   compIdx: number
   completions: CompletionItem[]
   empty: boolean
-  handleTextPaste: (event: PasteEvent) => ComposerPasteResult | null
+  handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   input: string
   inputBuf: string[]
   pagerPageSize: number
@@ -277,21 +321,7 @@ export interface AppLayoutComposerProps {
 }
 
 export interface AppLayoutProgressProps {
-  activity: ActivityItem[]
-  outcome: string
-  reasoning: string
-  reasoningActive: boolean
-  reasoningStreaming: boolean
-  reasoningTokens: number
   showProgressArea: boolean
-  showStreamingArea: boolean
-  streamPendingTools: string[]
-  streamSegments: Msg[]
-  streaming: string
-  subagents: SubagentProgress[]
-  toolTokens: number
-  tools: ActiveTool[]
-  turnTrail: string[]
 }
 
 export interface AppLayoutStatusProps {
@@ -301,6 +331,7 @@ export interface AppLayoutStatusProps {
   showStickyPrompt: boolean
   statusColor: string
   stickyPrompt: string
+  turnStartedAt: null | number
   voiceLabel: string
 }
 
@@ -335,5 +366,6 @@ export interface AppOverlaysProps {
 
 export interface PasteSnippet {
   label: string
+  path?: string
   text: string
 }
