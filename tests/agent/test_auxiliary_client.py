@@ -746,6 +746,45 @@ class TestAuxiliaryPoolAwareness:
         assert model == "openai/gpt-5.4-mini"
         assert mock_resolve.call_count == 1
 
+    def test_auto_cached_client_drops_openrouter_style_model_for_codex_main_runtime(self):
+        import agent.auxiliary_client as aux
+
+        fake_client = MagicMock()
+        fake_client.base_url = "https://chatgpt.com/backend-api/codex"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, "gpt-5.5"),
+        ) as mock_resolve:
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client(
+                    "auto",
+                    "google/gemini-3-flash-preview",
+                    main_runtime={
+                        "provider": "openai-codex",
+                        "model": "gpt-5.5",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                )
+                cached_client, cached_model = aux._get_cached_client(
+                    "auto",
+                    "google/gemini-3-flash-preview",
+                    main_runtime={
+                        "provider": "openai-codex",
+                        "model": "gpt-5.5",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                )
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fake_client
+        assert model == "gpt-5.5"
+        assert cached_client is fake_client
+        assert cached_model == "gpt-5.5"
+        assert mock_resolve.call_count == 1
+
 
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
 
