@@ -140,6 +140,9 @@ def _summarize_user_message_for_log(content: Any) -> str:
 # ID helpers
 # ---------------------------------------------------------------------------
 
+_RESPONSES_ITEM_ID_MAX_LEN = 64
+
+
 def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     """Generate a deterministic call_id from tool call content.
 
@@ -196,6 +199,26 @@ def _derive_responses_function_call_id(
     seed = source or str(response_item_id or "") or uuid.uuid4().hex
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
     return f"fc_{digest}"
+
+
+def _normalize_responses_message_item_id(raw_id: Any) -> Optional[str]:
+    """Return a replay-safe assistant message item id for Responses API input.
+
+    OpenAI's Responses API rejects ``input[*].id`` longer than 64 chars. Some
+    backends return opaque base64-like message ids around 400 chars long. Keep
+    short ids verbatim for prefix-cache continuity, but deterministically hash
+    overlong ids into a stable ``msg_<sha256>`` form so replayed history stays
+    valid across turns.
+    """
+    if not isinstance(raw_id, str):
+        return None
+    value = raw_id.strip()
+    if not value:
+        return None
+    if len(value) <= _RESPONSES_ITEM_ID_MAX_LEN:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    return f"msg_{digest[:_RESPONSES_ITEM_ID_MAX_LEN - len('msg_')]}"
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +351,9 @@ def _chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Di
                             "status": _normalize_responses_message_status(raw_item.get("status")),
                             "content": normalized_content_parts,
                         }
-                        item_id = raw_item.get("id")
-                        if isinstance(item_id, str) and item_id.strip():
-                            replay_item["id"] = item_id.strip()
+                        item_id = _normalize_responses_message_item_id(raw_item.get("id"))
+                        if item_id:
+                            replay_item["id"] = item_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()
@@ -531,9 +554,9 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 "status": _normalize_responses_message_status(item.get("status")),
                 "content": normalized_content,
             }
-            item_id = item.get("id")
-            if isinstance(item_id, str) and item_id.strip():
-                normalized_item["id"] = item_id.strip()
+            item_id = _normalize_responses_message_item_id(item.get("id"))
+            if item_id:
+                normalized_item["id"] = item_id
             phase = item.get("phase")
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()
@@ -859,8 +882,8 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                     "status": _normalize_responses_message_status(item_status),
                     "content": [{"type": "output_text", "text": message_text}],
                 }
-                item_id = getattr(item, "id", None)
-                if isinstance(item_id, str) and item_id:
+                item_id = _normalize_responses_message_item_id(getattr(item, "id", None))
+                if item_id:
                     raw_message_item["id"] = item_id
                 if normalized_phase:
                     raw_message_item["phase"] = normalized_phase

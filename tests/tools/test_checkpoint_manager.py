@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import pytest
 from pathlib import Path
@@ -21,6 +22,7 @@ from tools.checkpoint_manager import (
     _store_path,
     _ref_name,
     _project_meta_path,
+    _should_skip_checkpoint_dir,
     format_checkpoint_list,
     DEFAULT_EXCLUDES,
     CHECKPOINT_BASE,
@@ -102,6 +104,21 @@ class TestStorePath:
         tilde = f"~/{project.name}"
         assert _project_hash(tilde) == _project_hash(str(project))
 
+    def test_should_skip_checkpoint_dir_flags_broad_and_private_temp_dirs(self):
+        should_skip, reason = _should_skip_checkpoint_dir("/")
+        assert should_skip is True
+        assert "root" in reason
+
+        should_skip, reason = _should_skip_checkpoint_dir(tempfile.gettempdir())
+        assert should_skip is True
+        assert "ephemeral temp root" in reason
+
+        should_skip, reason = _should_skip_checkpoint_dir(
+            str(Path(tempfile.gettempdir()) / "systemd-private-demo")
+        )
+        assert should_skip is True
+        assert "private temp path" in reason
+
 
 # =========================================================================
 # Store init + legacy migration
@@ -116,7 +133,11 @@ class TestStoreInit:
         assert (store / "HEAD").exists()
         assert (store / "objects").exists()
         assert (store / "info" / "exclude").exists()
-        assert "node_modules/" in (store / "info" / "exclude").read_text()
+        exclude_text = (store / "info" / "exclude").read_text()
+        assert "node_modules/" in exclude_text
+        assert "systemd-private-*/" in exclude_text
+        assert "snap-private-tmp/" in exclude_text
+        assert "paperclip-worktree-repo-*/" in exclude_text
 
     def test_no_git_in_project_dir(self, work_dir, checkpoint_base, monkeypatch):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
@@ -207,6 +228,13 @@ class TestTakeCheckpoint:
 
     def test_skip_home_dir(self, mgr):
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
+
+    def test_skip_ephemeral_temp_root_dir(self, mgr):
+        assert mgr.ensure_checkpoint(tempfile.gettempdir(), "tmp root") is False
+
+    def test_skip_private_temp_subdir(self, mgr):
+        private_tmp = Path(tempfile.gettempdir()) / "systemd-private-demo"
+        assert mgr.ensure_checkpoint(str(private_tmp), "private tmp") is False
 
     def test_multiple_projects_share_store(self, mgr, tmp_path):
         """Two projects commit to the SAME shared store (dedup wins)."""

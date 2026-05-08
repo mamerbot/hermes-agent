@@ -2099,8 +2099,12 @@ def _write_slack_manifest_and_instruct():
         print_success(f"Slack app manifest written to: {target}")
         print_info(
             "   Paste it into https://api.slack.com/apps → your app → Features "
-            "→ App Manifest → Edit, then Save.  Slack will prompt to "
-            "reinstall if scopes or slash commands changed."
+            "→ App Manifest → Edit, then Save. Slack will prompt to "
+            "reinstall if scopes, App Home settings, or slash commands changed."
+        )
+        print_info(
+            "   App Home messages are enabled by default in this generated manifest; "
+            "reinstall after importing so DM replies can use Slack's messages tab."
         )
         print_info(
             "   Re-run `hermes slack manifest --write` anytime to refresh after "

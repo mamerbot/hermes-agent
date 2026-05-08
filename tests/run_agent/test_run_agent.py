@@ -16,7 +16,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from agent.codex_responses_adapter import _chat_messages_to_responses_input, _normalize_codex_response, _preflight_codex_input_items
+from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
+    _normalize_codex_response,
+    _normalize_responses_message_item_id,
+    _preflight_codex_input_items,
+)
 
 import run_agent
 from run_agent import AIAgent
@@ -4967,6 +4972,77 @@ class TestNormalizeCodexDictArguments:
         msg, _ = _normalize_codex_response(response)
         tc = msg.tool_calls[0]
         assert tc.function.arguments == args_str
+
+
+class TestResponsesMessageItemIdNormalization:
+    def test_overlong_item_ids_are_hashed_to_responses_safe_length(self):
+        raw_id = "x" * 408
+        normalized = _normalize_responses_message_item_id(raw_id)
+
+        assert normalized is not None
+        assert normalized.startswith("msg_")
+        assert len(normalized) == 64
+        assert normalized == _normalize_responses_message_item_id(raw_id)
+
+    def test_chat_messages_to_responses_input_clamps_overlong_assistant_item_ids(self):
+        raw_id = "assistant-msg-" + ("y" * 394)
+        items = _chat_messages_to_responses_input([
+            {
+                "role": "assistant",
+                "content": "hello",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "id": raw_id,
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    }
+                ],
+            }
+        ])
+
+        replay_item = items[0]
+        assert replay_item["type"] == "message"
+        assert replay_item["role"] == "assistant"
+        assert replay_item["id"].startswith("msg_")
+        assert len(replay_item["id"]) == 64
+
+    def test_preflight_codex_input_items_clamps_overlong_message_ids(self):
+        raw_id = "message-" + ("z" * 400)
+        normalized = _preflight_codex_input_items([
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": raw_id,
+                "content": [{"type": "output_text", "text": "done"}],
+            }
+        ])
+
+        assert normalized[0]["id"].startswith("msg_")
+        assert len(normalized[0]["id"]) == 64
+
+    def test_normalize_codex_response_clamps_overlong_message_ids(self):
+        raw_id = "message-" + ("q" * 400)
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    id=raw_id,
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="ok")],
+                )
+            ],
+            status="completed",
+        )
+
+        normalized, finish_reason = _normalize_codex_response(response)
+
+        assert finish_reason == "stop"
+        message_item = normalized.codex_message_items[0]
+        assert message_item["id"].startswith("msg_")
+        assert len(message_item["id"]) == 64
 
 
 # ---------------------------------------------------------------------------

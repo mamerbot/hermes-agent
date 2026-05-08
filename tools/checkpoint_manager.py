@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -104,6 +105,10 @@ DEFAULT_EXCLUDES = [
     ".svn/",
     # Worktrees (Hermes convention — don't recursively snapshot siblings)
     ".worktrees/",
+    # Ephemeral temp / nested worktree junk that should never enter checkpoints
+    "systemd-private-*/",
+    "snap-private-tmp/",
+    "paperclip-worktree-repo-*/",
     # Native / compiled binaries
     "*.so",
     "*.dylib",
@@ -193,6 +198,42 @@ def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
 def _normalize_path(path_value: str) -> Path:
     """Return a canonical absolute path for checkpoint operations."""
     return Path(path_value).expanduser().resolve()
+
+
+def _ephemeral_checkpoint_roots() -> Set[Path]:
+    """Known broad temp roots that should never be checkpointed directly."""
+    roots: Set[Path] = set()
+    for candidate in (tempfile.gettempdir(), "/var/tmp", "/dev/shm", os.getenv("XDG_RUNTIME_DIR")):
+        if not candidate:
+            continue
+        try:
+            roots.add(Path(candidate).expanduser().resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _is_ephemeral_checkpoint_path(path: Path) -> bool:
+    """True when the path is or lives under known host-private temp directories."""
+    ephemeral_names = {"snap-private-tmp"}
+    for part in path.parts:
+        if part in ephemeral_names or part.startswith("systemd-private-"):
+            return True
+    return False
+
+
+def _should_skip_checkpoint_dir(path_value: str) -> Tuple[bool, Optional[str]]:
+    """Return whether checkpointing this directory should be skipped."""
+    path = _normalize_path(path_value)
+    if path == Path("/"):
+        return True, "directory too broad (root)"
+    if path == Path.home():
+        return True, "directory too broad (home)"
+    if path in _ephemeral_checkpoint_roots():
+        return True, f"directory too broad (ephemeral temp root: {path})"
+    if _is_ephemeral_checkpoint_path(path):
+        return True, f"ephemeral/private temp path: {path}"
+    return False, None
 
 
 def _project_hash(working_dir: str) -> str:
@@ -636,9 +677,9 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in ("/", str(Path.home())):
-            logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+        should_skip, skip_reason = _should_skip_checkpoint_dir(abs_dir)
+        if should_skip:
+            logger.debug("Checkpoint skipped: %s", skip_reason)
             return False
 
         if abs_dir in self._checkpointed_dirs:

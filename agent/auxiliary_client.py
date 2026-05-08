@@ -3879,8 +3879,13 @@ def call_llm(
         )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
-        # auto (the default) = best-effort fallback chain.  (#7559)
-        is_auto = resolved_provider in ("auto", "", None)
+        # auto (the default) = best-effort fallback chain.  For vision calls we
+        # must key this off the ORIGINAL requested mode, not the resolved backend:
+        # resolve_vision_provider_client(auto) returns a concrete provider label
+        # like openrouter/nous/main-provider, and overwriting resolved_provider
+        # with that concrete winner previously disabled the fallback chain after
+        # 429 usage_limit_reached errors (#EMT-152).
+        is_auto = (original_provider_mode if task == "vision" else resolved_provider) in ("auto", "", None)
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
@@ -4175,7 +4180,7 @@ async def async_call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
         )
-        is_auto = resolved_provider in ("auto", "", None)
+        is_auto = (original_provider_mode if task == "vision" else resolved_provider) in ("auto", "", None)
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"

@@ -65,6 +65,11 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from gateway.bridges.paperclip_discord import (
+    PaperclipDiscordReplyBridge,
+    build_config as build_paperclip_reply_bridge_config,
+    context_from_discord_message,
+)
 from tools.url_safety import is_safe_url
 
 
@@ -565,6 +570,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        self._paperclip_reply_bridge = PaperclipDiscordReplyBridge(
+            build_paperclip_reply_bridge_config(self.config.extra)
+        )
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -706,6 +714,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.author == self._client.user:
                     return
 
+                if adapter_self._maybe_route_paperclip_webhook_reply(message):
+                    return
+
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
                 if message.type not in (discord.MessageType.default, discord.MessageType.reply):
@@ -838,6 +849,29 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
             self._release_platform_lock()
             return False
+
+    def _maybe_route_paperclip_webhook_reply(self, message: DiscordMessage) -> bool:
+        """Route human replies to persona webhook messages into Paperclip before normal handling."""
+        context = context_from_discord_message(message)
+        if context is None:
+            return False
+        result = self._paperclip_reply_bridge.route_reply(context)
+        if result.routed:
+            logger.info(
+                "Routed Discord webhook reply %s to Paperclip issue %s for agent %s via persona %s",
+                context.reply_message_id,
+                result.issue_id,
+                result.agent_id,
+                result.persona,
+            )
+            return True
+        if result.reason not in {"disabled", "channel_not_enabled", "not_webhook_reply", "unmapped_webhook"}:
+            logger.info(
+                "Discord webhook reply %s was not routed to Paperclip: %s",
+                context.reply_message_id,
+                result.reason,
+            )
+        return False
 
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
